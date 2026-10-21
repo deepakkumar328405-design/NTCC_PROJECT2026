@@ -1,46 +1,167 @@
 import express from "express";
-import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load .env from beside server.js, regardless of the folder the app is started from.
+dotenv.config({ path: path.join(__dirname, ".env") });
+
+const PORT = process.env.PORT || 3000;
+const API_KEY = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "").trim();
+const CHAT_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
+
+const ai = API_KEY ? new GoogleGenAI({ apiKey: API_KEY }) : null;
 
 const app = express();
 
-app.use(express.json());
-app.use(express.static("public"));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+const modePrompts = {
+    general: "You are Smart AI, a friendly and helpful personal assistant. Give clear, accurate and concise answers.",
+    creative: "You are Smart AI in Writing & Ideas mode. Help with creative writing, brainstorming and polished wording.",
+    study: "You are Smart AI in Study helper mode. Explain concepts step by step with simple examples, like a patient tutor.",
+    fitness: "You are Smart AI in Fitness coach mode. Give safe, general fitness and nutrition guidance suited to the user's level. Remind the user this is not medical advice and to consult a professional for injuries or health conditions."
+};
+
+function systemInstruction(mode, profile) {
+    let text = modePrompts[mode] || modePrompts.general;
+
+    if (mode === "fitness" && profile && typeof profile === "object") {
+        const details = Object.entries(profile)
+            .filter(([, value]) => value)
+            .map(([key, value]) => `${key}: ${String(value).slice(0, 100)}`)
+            .join(", ");
+        if (details) text += ` User preferences: ${details}.`;
+    }
+
+    return text;
+}
+
+// Convert the browser's history ({role: "user"|"assistant", content}) into Gemini's format.
+function toGeminiContents(history, message) {
+    const contents = [];
+
+    if (Array.isArray(history)) {
+        for (const item of history.slice(-20)) {
+            if (!item || typeof item.content !== "string" || !item.content.trim()) continue;
+            const role = item.role === "user" ? "user" : "model";
+            const last = contents[contents.length - 1];
+            // Gemini expects user/model turns to alternate; merge consecutive turns from the same role.
+            if (last && last.role === role) {
+                last.parts[0].text += "\n\n" + item.content;
+            } else {
+                contents.push({ role, parts: [{ text: item.content }] });
+            }
+        }
+    }
+
+    // The conversation must start with a user turn.
+    while (contents.length && contents[0].role !== "user") contents.shift();
+
+    const last = contents[contents.length - 1];
+    if (last && last.role === "user") {
+        last.parts[0].text += "\n\n" + message;
+    } else {
+        contents.push({ role: "user", parts: [{ text: message }] });
+    }
+
+    return contents;
+}
+
+function explainError(error) {
+    const status = error?.status;
+    const text = String(error?.message || "");
+
+    if (/API_KEY_INVALID|API key not valid/i.test(text)) {
+        return { status: 401, error: "Your Gemini API key is invalid. Check GEMINI_API_KEY in your .env file." };
+    }
+    if (status === 403 || /PERMISSION_DENIED/i.test(text)) {
+        return { status: 403, error: "Your Gemini API key does not have access to this model or the Generative Language API." };
+    }
+    if (status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(text)) {
+        return { status: 429, error: "Gemini quota or rate limit reached. Wait a minute and try again, or check your plan in Google AI Studio." };
+    }
+    if (status === 404 || /NOT_FOUND/i.test(text)) {
+        return { status: 404, error: "The configured Gemini model was not found. Check GEMINI_MODEL in your .env file." };
+    }
+    return { status: 500, error: "Unable to get an AI response. Check your internet connection and Gemini API key." };
+}
+
+function requireKey(res) {
+    if (ai) return true;
+    res.status(503).json({
+        error: "AI is not configured. Add GEMINI_API_KEY to the .env file beside server.js, then restart the server."
+    });
+    return false;
+}
+
+app.get("/api/health", (req, res) => {
+    res.json({ ok: true, configured: Boolean(ai), model: CHAT_MODEL });
 });
 
 app.post("/api/chat", async (req, res) => {
-    try {
-        const message = req.body.message;
+    const { message, history, mode, profile } = req.body || {};
 
-        if (!message || typeof message !== "string") {
-            return res.status(400).json({
-                error: "Please enter a message."
-            });
+    if (!message || typeof message !== "string" || !message.trim()) {
+        return res.status(400).json({ error: "Please enter a message." });
+    }
+    if (!requireKey(res)) return;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: CHAT_MODEL,
+            contents: toGeminiContents(history, message.slice(0, 8000)),
+            config: { systemInstruction: systemInstruction(mode, profile) }
+        });
+
+        res.json({ reply: response.text || "Sorry, I could not generate a response. Please try rephrasing." });
+    } catch (error) {
+        console.error("Gemini chat error:", error.message);
+        const { status, error: msg } = explainError(error);
+        res.status(status).json({ error: msg });
+    }
+});
+
+app.post("/api/image", async (req, res) => {
+    const { prompt } = req.body || {};
+
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+        return res.status(400).json({ error: "Please describe the image first." });
+    }
+    if (!requireKey(res)) return;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: IMAGE_MODEL,
+            contents: prompt.slice(0, 2000)
+        });
+
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        const imagePart = parts.find(part => part.inlineData?.data);
+
+        if (!imagePart) {
+            return res.status(502).json({ error: "Gemini did not return an image. Try a different description." });
         }
 
-        const response = await openai.responses.create({
-            model: "gpt-4.1-mini",
-            input: message
-        });
-
-        res.json({
-            reply: response.output_text
-        });
-
+        const { mimeType = "image/png", data } = imagePart.inlineData;
+        res.json({ image: `data:${mimeType};base64,${data}` });
     } catch (error) {
-        console.error("API Error:", error.message);
-
-        res.status(500).json({
-            error: "Unable to get an AI response. Check your API key and billing."
+        console.error("Gemini image error:", error.message);
+        const { status, error: msg } = explainError(error);
+        res.status(status).json({
+            error: status === 429
+                ? "Image generation quota reached. Gemini image models may need a paid (billing-enabled) API key."
+                : msg
         });
     }
 });
 
-app.listen(3000, () => {
-    console.log("Smart AI Chatbot running at http://localhost:3000");
+app.listen(PORT, () => {
+    console.log(`Smart AI Chatbot running at http://localhost:${PORT}`);
+    if (!ai) console.warn("Warning: GEMINI_API_KEY is not set. Add it to .env to enable AI replies.");
 });
